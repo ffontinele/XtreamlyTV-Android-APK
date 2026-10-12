@@ -19,6 +19,9 @@ import com.xtreamlytv.androidtv.data.ImportResult
 import com.xtreamlytv.androidtv.data.LocalStateStore
 import com.xtreamlytv.androidtv.data.ProviderUrl
 import com.xtreamlytv.androidtv.data.XtreamClient
+import com.xtreamlytv.androidtv.data.M3uParser
+import com.xtreamlytv.androidtv.data.M3uCredentialExtractor
+import com.xtreamlytv.androidtv.data.M3uChannel
 import com.xtreamlytv.androidtv.data.itemKey
 import com.xtreamlytv.androidtv.model.AppSettings
 import com.xtreamlytv.androidtv.model.CatalogItem
@@ -72,6 +75,7 @@ sealed interface AppScreen {
     ) : AppScreen
     data object Settings : AppScreen
     data object OfflineVideos : AppScreen
+    data object M3u : AppScreen
 }
 
 data class AppUiState(
@@ -119,6 +123,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var client: XtreamClient? = null
     private val categoryCache = LinkedHashMap<String, List<CatalogItem>>(16, 0.75f, true)
     private var catalogRequestId = 0L
+    private var m3uChannels = mutableMapOf<String, M3uChannel>()
+    private var m3uMode = false
+    private var m3uCatalog = mutableMapOf<String, List<CatalogItem>>()
     private val lastFocusByArea = mutableMapOf<String, FocusRequest>()
     private val _state = MutableStateFlow(AppUiState())
     val state: StateFlow<AppUiState> = _state.asStateFlow()
@@ -199,12 +206,18 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         failureScreen: AppScreen,
     ) {
         val normalizedCredentials = runCatching {
-            credentials.copy(
-                server = ProviderUrl.normalize(credentials.server),
-                username = credentials.username.trim(),
-            ).also {
-                require(it.username.isNotBlank()) { "Enter your provider username." }
-                require(it.password.isNotBlank()) { "Enter your provider password." }
+            if (credentials.kind == "m3u") {
+                credentials.copy(server = credentials.server.trim()).also {
+                    require(it.server.isNotBlank()) { "Enter the M3U URL." }
+                }
+            } else {
+                credentials.copy(
+                    server = ProviderUrl.normalize(credentials.server),
+                    username = credentials.username.trim(),
+                ).also {
+                    require(it.username.isNotBlank()) { "Enter your provider username." }
+                    require(it.password.isNotBlank()) { "Enter your provider password." }
+                }
             }
         }.getOrElse { error ->
             _state.update {
@@ -229,21 +242,76 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
+        if (normalizedCredentials.kind == "m3u") {
+            viewModelScope.launch {
+                try {
+                    val channels = withTimeout(180_000L) {
+                        val f = ensureM3uLocal(normalizedCredentials)
+                        M3uParser.parseFromFile(f, limit = 30_000)
+                    }
+                    client = null
+                    m3uMode = true
+                    m3uChannels.clear()
+                    channels.forEach { m3uChannels[it.id] = it }
+                    val cats = installM3uChannels(channels)
+                    if (persist) {
+                        withContext(Dispatchers.IO) {
+                            val list = credentialsStore.loadAll().toMutableList()
+                            val idx = list.indexOfFirst { (it.server == normalizedCredentials.server || ProviderUrl.normalize(it.server) == normalizedCredentials.server || it.server == ProviderUrl.normalize(normalizedCredentials.server)) && it.username == normalizedCredentials.username }
+                            if (idx >= 0) { list[idx] = normalizedCredentials.copy(id = list[idx].id, name = list[idx].name) } else { list.add(normalizedCredentials) }
+                            credentialsStore.saveAll(list)
+                            credentialsStore.setActive(normalizedCredentials.id)
+                        }
+                    }
+                    _state.update {
+                        it.copy(
+                            screen = successScreen,
+                            initializing = false,
+                            loading = false,
+                            catalogsLoading = false,
+                            error = null,
+                            provider = ProviderSummary(username = "M3U", status = "Active", expiration = null),
+                            categories = cats,
+                            selectedCategories = emptyMap(),
+                            items = emptyList(),
+                            loadedItems = emptyMap(),
+                            searchQuery = "",
+                        )
+                    }
+                    val firstType = cats.keys.firstOrNull() ?: ContentType.LIVE
+                    val firstCat = cats[firstType]?.firstOrNull { it.id != firstType.name + ":all" } ?: cats[firstType]?.firstOrNull()
+                    firstCat?.let { selectCategory(firstType, it) }
+                } catch (error: CancellationException) {
+                    if (error !is TimeoutCancellationException) throw error
+                    connectionFailed(error, failureScreen, startup)
+                } catch (error: Throwable) {
+                    connectionFailed(error, failureScreen, startup)
+                }
+            }
+            return
+        }
+
         viewModelScope.launch {
             try {
+                m3uMode = false
+                m3uCatalog.clear()
                 val candidate = XtreamClient(normalizedCredentials)
                 val profile = withTimeout(CONNECTION_TIMEOUT_MS) { candidate.authenticate() }
 
                 client = candidate
                 categoryCache.clear()
                 if (persist) {
+                    val namedCred = if (normalizedCredentials.name.isBlank() || normalizedCredentials.name == "Default") {
+                        normalizedCredentials.copy(name = normalizedCredentials.server.removePrefix("http://").removePrefix("https://").substringBefore("/").substringBefore(":"))
+                    } else normalizedCredentials
                     withContext(Dispatchers.IO) {
                         val list = credentialsStore.loadAll().toMutableList()
-                        val idx = list.indexOfFirst { it.server == normalizedCredentials.server && it.username == normalizedCredentials.username }
-                        if (idx >= 0) { list[idx] = normalizedCredentials.copy(id = list[idx].id, name = list[idx].name) } else { list.add(normalizedCredentials) }
+                        val idx = list.indexOfFirst { (it.server == namedCred.server || ProviderUrl.normalize(it.server) == namedCred.server || it.server == ProviderUrl.normalize(namedCred.server)) && it.username == namedCred.username }
+                        if (idx >= 0) { list[idx] = namedCred.copy(id = list[idx].id, name = list[idx].name) } else { list.add(namedCred) }
                         credentialsStore.saveAll(list)
-                        credentialsStore.setActive(normalizedCredentials.id)
+                        credentialsStore.setActive(namedCred.id)
                     }
+                    _state.update { it.copy(credentials = namedCred) }
                 }
                 _state.update {
                     it.copy(
@@ -346,6 +414,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
+    fun openM3u() {
+        _state.update { it.copy(screen = AppScreen.M3u, searchQuery = "", error = null, focusRequest = null) }
+        refreshM3uTabFromCache()
+    }
+
     fun openSettings() = _state.update {
         it.copy(screen = AppScreen.Settings, items = emptyList(), searchQuery = "", error = null, focusRequest = null)
     }
@@ -373,6 +446,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         category: Category,
         preserveRememberedFocus: Boolean = false,
     ) {
+        if (m3uMode) {
+            val list = m3uCatalog[category.id].orEmpty()
+            _state.update {
+                it.copy(
+                    loading = false,
+                    selectedCategories = it.selectedCategories + (type to category),
+                    items = list,
+                    searchQuery = "",
+                    error = null,
+                    focusRequest = if (preserveRememberedFocus) it.focusRequest
+                    else FocusRequest(catalogFocusScope(type, category.id), firstItem = true),
+                )
+            }
+            updateLoadedItems(type, list)
+            return
+        }
         val api = client ?: return
         val key = cacheKey(type, category.id)
         val cached = categoryCache[key]
@@ -467,6 +556,22 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun play(item: CatalogItem, queue: List<CatalogItem> = currentQueueFor(item)) {
+        // Check if this is an M3U channel
+        val m3u = m3uChannels[item.id]
+        if (m3u != null) {
+            val origin = _state.value.screen
+            val returnFocus = focusForScreen(origin)
+            val request = PlayerRequest(
+                item = item,
+                queue = queue.ifEmpty { listOf(item) },
+                urlCandidates = listOf(m3u.url),
+                startPositionMs = 0L,
+            )
+            addRecent(item)
+            _state.update { it.copy(screen = AppScreen.Player(request, origin, returnFocus), error = null, focusRequest = null) }
+            return
+        }
+        
         val api = client ?: return
         val playableQueue = queue.filter { it.type == item.type && it.type != ContentType.SERIES }
         val origin = _state.value.screen
@@ -475,11 +580,60 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val request = PlayerRequest(
             item = item,
             queue = playableQueue.ifEmpty { listOf(item) },
-            urlCandidates = api.streamCandidates(item, _state.value.settings.streamFormat),
+            urlCandidates = urlCandidatesFor(item),
             startPositionMs = progress?.positionMs ?: 0L,
         )
         addRecent(item)
         _state.update { it.copy(screen = AppScreen.Player(request, origin, returnFocus), error = null, focusRequest = null) }
+    }
+
+    private suspend fun ensureM3uLocal(cred: Credentials): java.io.File = withContext(Dispatchers.IO) {
+        val f = java.io.File(getApplication<android.app.Application>().cacheDir, "m3u_" + cred.id + ".m3u")
+        if (f.exists() && f.length() > 0) return@withContext f
+        val conn = M3uParser.openConnection(cred.server)
+        conn.inputStream.use { input -> f.outputStream().use { out -> input.copyTo(out, 65536) } }
+        f
+    }
+
+    private fun m3uItemType(ch: M3uChannel): ContentType = when {
+        ch.url.contains("/movie/") || Regex("(?i)(filme|movie|cinema|vod)").containsMatchIn(ch.group) -> ContentType.MOVIE
+        else -> ContentType.LIVE
+    }
+
+    private fun installM3uChannels(channels: List<M3uChannel>): Map<ContentType, List<Category>> {
+        m3uChannels.clear()
+        channels.forEach { m3uChannels[it.id] = it }
+        m3uCatalog.clear()
+        val liveItems = mutableListOf<CatalogItem>()
+        val movieItems = mutableListOf<CatalogItem>()
+        val liveGroups = linkedMapOf<String, MutableList<CatalogItem>>()
+        val movieGroups = linkedMapOf<String, MutableList<CatalogItem>>()
+        channels.forEach { ch ->
+            val type = m3uItemType(ch)
+            val catId = type.name + ":" + ch.group
+            val item = CatalogItem(id = ch.id, type = type, name = ch.name, categoryId = catId, imageUrl = ch.logo)
+            if (type == ContentType.MOVIE) {
+                movieItems.add(item)
+                movieGroups.getOrPut(ch.group) { mutableListOf() }.add(item)
+            } else {
+                liveItems.add(item)
+                liveGroups.getOrPut(ch.group) { mutableListOf() }.add(item)
+            }
+        }
+        m3uCatalog["LIVE:all"] = liveItems
+        m3uCatalog["MOVIE:all"] = movieItems
+        liveGroups.forEach { (g, list) -> m3uCatalog["LIVE:$g"] = list }
+        movieGroups.forEach { (g, list) -> m3uCatalog["MOVIE:$g"] = list }
+        val cats = mutableMapOf<ContentType, List<Category>>()
+        if (liveItems.isNotEmpty()) cats[ContentType.LIVE] = listOf(Category("LIVE:all", "ALL")) + liveGroups.keys.map { Category("LIVE:$it", it) }
+        if (movieItems.isNotEmpty()) cats[ContentType.MOVIE] = listOf(Category("MOVIE:all", "ALL")) + movieGroups.keys.map { Category("MOVIE:$it", it) }
+        return cats
+    }
+
+    private fun urlCandidatesFor(item: CatalogItem): List<String> {
+        m3uChannels[item.id]?.let { return listOf(it.url) }
+        val api = client ?: return emptyList()
+        return api.streamCandidates(item, _state.value.settings.streamFormat)
     }
 
     fun playAdjacent(delta: Int) {
@@ -488,7 +642,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val currentIndex = queue.indexOfFirst { itemKey(it) == itemKey(screen.request.item) }
         if (currentIndex < 0 || queue.size < 2) return
         val next = queue[(currentIndex + delta + queue.size) % queue.size]
-        val api = client ?: return
         val progress = _state.value.progress[itemKey(next)]
         addRecent(next)
         _state.update {
@@ -497,7 +650,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     request = PlayerRequest(
                         item = next,
                         queue = queue,
-                        urlCandidates = api.streamCandidates(next, it.settings.streamFormat),
+                        urlCandidates = urlCandidatesFor(next),
                         startPositionMs = progress?.positionMs ?: 0L,
                     ),
                     origin = screen.origin,
@@ -700,6 +853,82 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) { localStateStore.saveSettings(normalized) }
     }
 
+    fun loadM3uFromUrl(url: String) {
+        val trimmed = url.trim()
+        if (trimmed.isBlank()) return
+        viewModelScope.launch {
+            _state.update { it.copy(loading = true, error = "Baixando lista...") }
+            try {
+                val derived = runCatching {
+                    val u = java.net.URI(trimmed)
+                    (u.path?.substringAfterLast('/')?.takeIf { it.isNotBlank() } ?: u.host).take(24)
+                }.getOrDefault("M3U List")
+                val credId = "m3u_" + Integer.toHexString(trimmed.hashCode())
+                val newCred = Credentials(server = trimmed, username = "m3u", password = "", id = credId, name = derived, kind = "m3u")
+                val list = credentialsStore.loadAll().toMutableList()
+                val idx = list.indexOfFirst { it.kind == "m3u" && it.server == trimmed }
+                val useCred = if (idx >= 0) {
+                    list[idx] = list[idx].copy(name = derived)
+                    credentialsStore.saveAll(list)
+                    credentialsStore.setActive(list[idx].id)
+                    list[idx]
+                } else {
+                    list.add(newCred)
+                    credentialsStore.saveAll(list)
+                    credentialsStore.setActive(credId)
+                    newCred
+                }
+                val cacheFile = java.io.File(getApplication<android.app.Application>().cacheDir, "m3u_" + useCred.id + ".m3u")
+                cacheFile.delete()
+                val local = ensureM3uLocal(useCred)
+                val channels = M3uParser.parseFromFile(local, limit = 30_000)
+                client = null
+                m3uMode = true
+                val cats = installM3uChannels(channels)
+                _state.update {
+                    it.copy(
+                        loading = false,
+                        screen = AppScreen.Catalog(ContentType.LIVE),
+                        error = "OK: ${channels.size} canais salvos como provider \"${useCred.name}\" (veja em Live TV)",
+                        provider = ProviderSummary(username = useCred.name, status = "Active", expiration = null),
+                        categories = cats,
+                        selectedCategories = emptyMap(),
+                        items = emptyList(),
+                        loadedItems = emptyMap(),
+                        searchQuery = "",
+                        credentials = useCred,
+                    )
+                }
+                val firstType = cats.keys.firstOrNull() ?: ContentType.LIVE
+                val firstCat = cats[firstType]?.firstOrNull { it.id != firstType.name + ":all" } ?: cats[firstType]?.firstOrNull()
+                firstCat?.let { selectCategory(firstType, it) }
+            } catch (e: Exception) {
+                _state.update { it.copy(loading = false, error = "ERRO ${e::class.simpleName}: ${e.message?.take(140)}") }
+            }
+        }
+    }
+
+    fun refreshM3uTabFromCache() {
+        viewModelScope.launch {
+            val f = java.io.File(getApplication<android.app.Application>().cacheDir, "m3u_m3u_tab.m3u")
+            if (f.exists() && f.length() > 0 && !m3uMode) {
+                val channels = M3uParser.parseFromFile(f, limit = 30_000)
+                client = null
+                m3uMode = true
+                val cats = installM3uChannels(channels)
+                _state.update {
+                    it.copy(
+                        error = "Lista do cache reativada: ${channels.size} canais em Live TV",
+                        categories = cats,
+                        selectedCategories = emptyMap(),
+                        items = emptyList(),
+                        loadedItems = emptyMap(),
+                    )
+                }
+            }
+        }
+    }
+
     fun clearCatalogCache() {
         categoryCache.clear()
         _state.update { it.copy(items = emptyList(), loadedItems = emptyMap(), error = null) }
@@ -834,13 +1063,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (idx < 0) return
         val target = idx + delta
         if (target !in queue.indices) return
-        val api = client ?: return
         val item = queue[target]
         val progress = _state.value.progress[itemKey(item)]
         val request = PlayerRequest(
             item = item,
             queue = queue,
-            urlCandidates = api.streamCandidates(item, _state.value.settings.streamFormat),
+            urlCandidates = urlCandidatesFor(item),
             startPositionMs = progress?.positionMs ?: 0L,
         )
         addRecent(item)
@@ -882,6 +1110,118 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         connect(novo)
     }
 
+    fun importM3uAsProvider(url: String, onResult: (String) -> Unit = {}) {
+        val trimmed = url.trim()
+        if (trimmed.isBlank()) { onResult("URL vazia."); return }
+        viewModelScope.launch {
+            try {
+                _state.update { it.copy(loading = true, error = null) }
+                val head = kotlin.runCatching { M3uCredentialExtractor.fetchFirstLines(trimmed) }.getOrDefault("")
+                val extracted = M3uCredentialExtractor.extract(trimmed + "\n" + head)
+                if (extracted != null) {
+                    onResult("Credenciais extraídas — conectando como Xtream...")
+                    val current = credentialsStore.loadAll().toMutableList()
+                    current.add(extracted)
+                    credentialsStore.saveAll(current)
+                    credentialsStore.setActive(extracted.id)
+                    _state.update { it.copy(loading = false) }
+                    connect(extracted)
+                } else {
+                    onResult("Lista pública detectada — carregando como M3U nativo...")
+                    addM3uProvider("M3U List", trimmed)
+                    _state.update { it.copy(loading = false) }
+                }
+            } catch (e: Exception) {
+                _state.update { it.copy(loading = false, error = "Falha ao importar M3U: ${e.message?.take(120) ?: "erro"}") }
+                onResult("Erro: ${e.message?.take(80)}")
+            }
+        }
+    }
+
+    fun importM3uFromFile(uri: android.net.Uri, onResult: (String) -> Unit = {}) {
+        viewModelScope.launch {
+            try {
+                _state.update { it.copy(loading = true, error = null) }
+                val text = withContext(Dispatchers.IO) {
+                    getApplication<android.app.Application>().contentResolver.openInputStream(uri)?.bufferedReader()?.use { r ->
+                        val sb = StringBuilder()
+                        var lines = 0
+                        var bytes = 0L
+                        while (lines < 200 && bytes < 256 * 1024) {
+                            val line = r.readLine() ?: break
+                            sb.appendLine(line)
+                            bytes += line.length + 1
+                            lines++
+                        }
+                        sb.toString()
+                    } ?: ""
+                }
+                val extracted = M3uCredentialExtractor.extract(text)
+                if (extracted != null) {
+                    onResult("Credenciais extraídas do arquivo — conectando como Xtream...")
+                    val current = credentialsStore.loadAll().toMutableList()
+                    current.add(extracted)
+                    credentialsStore.saveAll(current)
+                    credentialsStore.setActive(extracted.id)
+                    _state.update { it.copy(loading = false) }
+                    connect(extracted)
+                } else {
+                    // fallback: salvar o arquivo no cache como provider M3U
+                    val id = java.util.UUID.randomUUID().toString()
+                    val f = java.io.File(getApplication<android.app.Application>().cacheDir, "m3u_$id.m3u")
+                    withContext(Dispatchers.IO) {
+                        getApplication<android.app.Application>().contentResolver.openInputStream(uri)?.use { input ->
+                            f.outputStream().use { out -> input.copyTo(out) }
+                        }
+                    }
+                    val channels = M3uParser.parseFromFile(f, limit = 30_000)
+                    client = null
+                    m3uMode = true
+                    m3uChannels.clear()
+                    channels.forEach { m3uChannels[it.id] = it }
+                    val cats = installM3uChannels(channels)
+                    val cred = Credentials(server = "file://$id", username = "m3u", password = "", name = "Arquivo M3U", kind = "m3u")
+                    val current = credentialsStore.loadAll().toMutableList()
+                    current.add(cred)
+                    credentialsStore.saveAll(current)
+                    credentialsStore.setActive(cred.id)
+                    _state.update {
+                        it.copy(
+                            screen = AppScreen.Catalog(ContentType.LIVE),
+                            initializing = false,
+                            loading = false,
+                            catalogsLoading = false,
+                            error = null,
+                            provider = ProviderSummary(username = "M3U", status = "Active", expiration = null),
+                            categories = cats,
+                            selectedCategories = emptyMap(),
+                            items = emptyList(),
+                            loadedItems = emptyMap(),
+                            searchQuery = "",
+                            credentials = cred,
+                        )
+                    }
+                    val firstType = cats.keys.firstOrNull() ?: ContentType.LIVE
+                    val firstCat = cats[firstType]?.firstOrNull { it.id != firstType.name + ":all" } ?: cats[firstType]?.firstOrNull()
+                    firstCat?.let { selectCategory(firstType, it) }
+                    onResult("Lista pública carregada do arquivo.")
+                }
+            } catch (e: Exception) {
+                _state.update { it.copy(loading = false, error = "Falha ao ler arquivo: ${e.message?.take(120) ?: "erro"}") }
+                onResult("Erro: ${e.message?.take(80)}")
+            }
+        }
+    }
+
+    fun addM3uProvider(name: String, url: String) {
+        val cred = Credentials(server = url.trim(), username = "m3u", password = "", name = name.ifBlank { "M3U List" }, kind = "m3u")
+        val current = credentialsStore.loadAll().toMutableList()
+        current.add(cred)
+        credentialsStore.saveAll(current)
+        credentialsStore.setActive(cred.id)
+        connect(cred)
+    }
+
     fun updateProviderById(id: String, name: String, credentials: Credentials) {
         val current = credentialsStore.loadAll().toMutableList()
         val idx = current.indexOfFirst { it.id == id }
@@ -893,6 +1233,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun deleteProvider(id: String) {
+        runCatching { java.io.File(getApplication<android.app.Application>().cacheDir, "m3u_$id.m3u").delete() }
         val current = credentialsStore.loadAll().toMutableList()
         val removed = current.firstOrNull { it.id == id } ?: return
         current.remove(removed)
@@ -910,6 +1251,9 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() {
         client = null
+        m3uMode = false
+        m3uCatalog.clear()
+        m3uChannels.clear()
         categoryCache.clear()
         lastFocusByArea.clear()
         _state.update {
@@ -935,7 +1279,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun back() {
         when (val screen = _state.value.screen) {
-            AppScreen.Login, AppScreen.Home -> Unit
+            AppScreen.Login, AppScreen.Home, AppScreen.M3u -> Unit
             is AppScreen.Player -> _state.update {
                 it.copy(screen = screen.origin, error = null, focusRequest = screen.returnFocus)
             }

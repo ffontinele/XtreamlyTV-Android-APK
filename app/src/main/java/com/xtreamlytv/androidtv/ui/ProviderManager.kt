@@ -62,6 +62,7 @@ fun ProviderManagerCard(state: AppUiState, viewModel: AppViewModel) {
     var deleteConfirmId by remember { mutableStateOf<String?>(null) }
     var validityCheckId by remember { mutableStateOf<String?>(null) }
     var showQr by remember { mutableStateOf(false) }
+    var showM3uImport by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
     Column(
@@ -103,10 +104,18 @@ fun ProviderManagerCard(state: AppUiState, viewModel: AppViewModel) {
         Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
             TvButton("+ Add provider", { addingProvider = true }, Modifier.width(150.dp))
             TvButton("QR Code", { showQr = true }, Modifier.width(110.dp), TvButtonStyle.Secondary)
+            TvButton("M3U", { showM3uImport = true }, Modifier.width(90.dp), TvButtonStyle.Secondary)
             TvButton("Disconnect", viewModel::disconnect, Modifier.width(140.dp), TvButtonStyle.Danger)
         }
         if (showQr) {
             QrDialog(url = CloudSync.getQrUrl(context), onDismiss = { showQr = false })
+        }
+        if (showM3uImport) {
+            M3uImportDialog(
+                onDismiss = { showM3uImport = false },
+                onImportUrl = { url -> viewModel.importM3uAsProvider(url); showM3uImport = false },
+                onImportFile = { uri -> viewModel.importM3uFromFile(uri); showM3uImport = false },
+            )
         }
         validityCheckId?.let { vid ->
             val vcred = providers.find { it.id == vid }
@@ -184,6 +193,7 @@ private fun ProviderRow(
             Box(Modifier.size(8.dp).background(if (active) colors.accent else colors.muted, CircleShape))
             Spacer(Modifier.width(10.dp))
             Text(cred.name, color = colors.text, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            if (cred.kind == "m3u") Text("M3U", color = colors.muted, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp))
             if (active) Text("ACTIVE", color = colors.accent, fontSize = 9.sp, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(4.dp))

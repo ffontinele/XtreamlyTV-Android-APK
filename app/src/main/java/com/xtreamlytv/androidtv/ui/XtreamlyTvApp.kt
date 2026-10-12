@@ -73,7 +73,7 @@ fun XtreamlyTvApp(
             pending.forEach { p ->
                 withContext(Dispatchers.Main) {
                     Toast.makeText(context, "Lista recebida: " + p.name, Toast.LENGTH_LONG).show()
-                    viewModel.connect(Credentials(p.server, p.username, p.password))
+                    viewModel.connect(Credentials(server = p.server, username = p.username, password = p.password, name = p.name))
                 }
                 withContext(Dispatchers.IO) { CloudSync.markLoaded(context, p.id) }
             }
@@ -158,6 +158,7 @@ private fun AppShell(state: AppUiState, viewModel: AppViewModel) {
                         is AppScreen.FavoriteGroupEditor -> FavoriteGroupEditorScreen(screen.groupId, state, viewModel)
                         AppScreen.Settings -> SettingsScreen(state, viewModel)
                         AppScreen.OfflineVideos -> OfflineVideosScreen(state, viewModel)
+                        AppScreen.M3u -> M3uScreen(state, viewModel)
                         else -> Unit
                     }
                 }
@@ -192,6 +193,7 @@ private fun Sidebar(
             SidebarItem("heart", "Favorites", screen.section() == AppSection.Favorites, viewModel::openFavorites)
             SidebarItem("settings", "Settings", screen.section() == AppSection.Settings, viewModel::openSettings)
             SidebarItem("folder", "Vídeos offline", screen.section() == AppSection.Offline) { viewModel.openOfflineVideos() }
+            SidebarItem("list", "M3U", screen.section() == AppSection.M3u) { viewModel.openM3u() }
             }
         }
         Spacer(Modifier.weight(1f))
@@ -243,7 +245,12 @@ private fun Topbar(title: String, state: AppUiState) {
         state.provider?.let { provider ->
             Box(Modifier.size(7.dp).background(colors.accent, CircleShape))
             Spacer(Modifier.width(8.dp))
-            Text(provider.status.ifBlank { "Connected" }, color = colors.muted, fontSize = 10.sp, maxLines = 1)
+            Text(
+                (state.credentials?.name?.takeIf { it.isNotBlank() }?.let { "${it.take(24)} · " } ?: "") + provider.status.ifBlank { "Connected" },
+                color = colors.muted,
+                fontSize = 10.sp,
+                maxLines = 1,
+            )
             Spacer(Modifier.width(17.dp))
             ClockText()
         }
@@ -265,7 +272,7 @@ private fun ClockText() {
 
 private fun formatClock(): String = SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date())
 
-private enum class AppSection { Home, Live, Movies, Series, Favorites, Settings, Offline }
+private enum class AppSection { Home, Live, Movies, Series, Favorites, Settings, Offline, M3u }
 
 private fun AppScreen.section(): AppSection = when (this) {
     AppScreen.Home -> AppSection.Home
@@ -278,6 +285,7 @@ private fun AppScreen.section(): AppSection = when (this) {
     AppScreen.Favorites, is AppScreen.FavoriteGroupBrowser, AppScreen.FavoriteGroupsManager, is AppScreen.FavoriteGroupEditor -> AppSection.Favorites
     AppScreen.Settings -> AppSection.Settings
     AppScreen.OfflineVideos -> AppSection.Offline
+    AppScreen.M3u -> AppSection.M3u
     is AppScreen.Player -> origin.section()
     AppScreen.Login -> AppSection.Home
 }
@@ -295,6 +303,7 @@ private fun screenTitle(screen: AppScreen): String = when (screen) {
     is AppScreen.FavoriteGroupBrowser -> "Favorites"
     AppScreen.FavoriteGroupsManager -> "Edit Groups"
     is AppScreen.FavoriteGroupEditor -> if (screen.groupId == null) "Add Group" else "Edit Group"
+    AppScreen.M3u -> "M3U"
     AppScreen.Settings -> "Settings"
     AppScreen.OfflineVideos -> "Vídeos offline"
     is AppScreen.Player -> screen.request.item.name
